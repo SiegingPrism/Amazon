@@ -1,0 +1,28 @@
+# Raw competition datasets (2.3+ GB, raw training/test TSVs)
+dataset/
+dataset/*
+
+# Large intermediate outputs (> 100 MB GitHub hard limit)
+output/*.tsv
+output/*.joblib
+!output/matching_results.tsv.gz
+
+# Large archive exceeding GitHub 100 MB limit
+NeuralEntity_submission.zip
+
+# Python Virtual Environments & Caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# macOS / OS metadata
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
