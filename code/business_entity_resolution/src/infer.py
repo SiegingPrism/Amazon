@@ -42,14 +42,14 @@ def run_inference(test_dir="dataset/test", output_dir="output", model_path=None)
             "top_addr": 10
         },
         "US": {
-            "th_addr": 0.80,
-            "th_no_addr": 0.82,
+            "th_addr": 0.872,
+            "th_no_addr": 0.820,
             "top_name": 22,
             "top_addr": 10
         },
         "India": {
-            "th_addr": 0.86,
-            "th_no_addr": 0.78,
+            "th_addr": 0.882,
+            "th_no_addr": 0.786,
             "top_name": 22,
             "top_addr": 10
         }
