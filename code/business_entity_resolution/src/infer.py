@@ -167,6 +167,19 @@ def run_inference(test_dir="dataset/test", output_dir="output", model_path=None)
                         continue
                         
                     feats = compute_features_precleaned(cn1, ca1, cn2, ca2, ha2)
+                    n_fuzz = feats[0]
+                    n_set = feats[2]
+                    a_set = feats[7]
+                    num_m = feats[10]
+                    
+                    # Multi-tenant commercial building guard:
+                    # Different businesses sharing an office tower/industrial park
+                    n_cut = 0.52 if country == "US" else 0.55
+                    if n_set < n_cut and n_fuzz < n_cut:
+                        continue
+                    if num_m == 0.0 and n_set < (0.62 if country == "US" else 0.65):
+                        continue
+                        
                     batch_feats.append(feats)
                     pair_tracking.append((eid, cid, ha2, feats))
                     
@@ -174,18 +187,15 @@ def run_inference(test_dir="dataset/test", output_dir="output", model_path=None)
             if batch_feats:
                 X = np.array(batch_feats, dtype=np.float32)
                 probs = clf.predict_proba(X)[:, 1]
+                n_cut = 0.52 if country == "US" else 0.55
                 for (eid, cid, ha2, feats), p in zip(pair_tracking, probs):
                     eff_threshold = th_addr if ha2 else th_no_addr
                     
-                    # Multi-tenant conflict guard:
-                    # 1. Conflicting street numbers with different names
-                    num_m = feats[10]
-                    n_sim = feats[2]
-                    if num_m == 0.0 and n_sim < 0.45:
-                        continue
-                    # 2. No name similarity without an exact door match
-                    if n_sim < 0.20 and (num_m != 1.0 or feats[7] < 0.95):
-                        continue
+                    # High-confidence name match bonus (recovers true missing-address matches)
+                    n_set = feats[2]
+                    a_set = feats[7]
+                    if n_set >= 0.92 and (a_set >= 0.70 or not ha2):
+                        eff_threshold = min(eff_threshold, 0.74)
                         
                     if p >= eff_threshold:
                         match_results[eid].append((cid, float(p)))

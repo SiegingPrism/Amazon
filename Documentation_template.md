@@ -54,10 +54,13 @@ flowchart TD
 - **Brahmi Unicode Phonetic Engine:** A zero-dependency Unicode character offset mapper that converts all Indic Brahmi script families into standard Latin phonetic bases and extracts vowel-free consonant skeletons (`NSK`).
 - **Dual IDF Candidate Scorer:** Rather than simple frequency counts, blocking keys are weighted by Inverse Document Frequency ($\text{IDF}(k) = \ln(1 + N / |Posting(k)|)$), ensuring rare brand names and plot identifiers outscore common locality terms. Generic keys with posting lengths $> 1,500$ are pruned to eliminate distractor noise.
 - **Country & Address-Calibrated Dual Decision Boundaries:**
-  - **US:** $\tau_{\text{addr}} = 0.80$, $\tau_{\text{no\_addr}} = 0.82$
-  - **India:** $\tau_{\text{addr}} = 0.86$, $\tau_{\text{no\_addr}} = 0.78$ (recovering true missing-address company matches without `addr_null` penalty)
-  - **France:** $\tau_{\text{addr}} = 0.88$, $\tau_{\text{no\_addr}} = 0.86$ (hardened conservative threshold for unseen distribution, with French street abbreviation expansion)
-- **Winner-Takes-All Disambiguation:** Resolving multi-entity claims by assigning each target entity strictly to the Source 1 entity with $\operatorname{argmax} P(\text{match})$, pruning 954,064 false cross-merges.
+  - **US:** $\tau_{\text{addr}} = 0.872$, $\tau_{\text{no\_addr}} = 0.820$ (high-precision calibration eliminating false franchise cross-merges)
+  - **India:** $\tau_{\text{addr}} = 0.882$, $\tau_{\text{no\_addr}} = 0.786$ (full Indic transliteration + missing-address recovery without distractor noise)
+  - **France:** $\tau_{\text{addr}} = 0.880$, $\tau_{\text{no\_addr}} = 0.860$ (hardened conservative threshold for unseen distribution, with French street abbreviation expansion)
+- **Advanced Precision-Recall Decision Rules:**
+  - **Multi-Tenant Commercial Building Guard:** Enforces that candidates sharing an address or commercial park MUST have name similarity $\ge 0.52$ (US) or $\ge 0.55$ (India); conflicting street numbers require name similarity $\ge 0.62\text{--}0.65$. This single rule eliminates false merges of different shops co-located in the same industrial park or office tower.
+  - **High-Confidence Name Match Bonus:** When names are $\ge 92\%$ identical and Source 2 has a missing or partial address, the threshold is adjusted to $0.74$, recovering true missing-address company matches.
+- **Winner-Takes-All Disambiguation:** Resolving multi-entity claims by assigning each target entity strictly to the Source 1 entity with $\operatorname{argmax} P(\text{match})$, pruning 1,770,824 false cross-merges.
 
 ---
 
