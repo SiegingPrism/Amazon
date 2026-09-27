@@ -7,63 +7,73 @@ import time, joblib
 from collections import defaultdict
 from rapidfuzz import fuzz
 
-from src.utils import clean_text, clean_address
-from src.features import compute_features_precleaned
+from src.utils import clean_text, clean_address, LEGAL_STOPWORDS
+from src.features_v2 import compute_features_v2_precleaned
 from src.blocking import InvertedIndex
 
-def run_inference(test_dir="dataset/test", output_dir="output", model_path=None):
-    if model_path is None:
-        model_path = os.path.join(os.path.dirname(__file__), "matching_model.joblib")
-        
+def run_inference(test_dir="dataset/test", output_dir="output"):
     print("="*75)
-    print("      COMPETITIVE BUSINESS ENTITY RESOLUTION INFERENCE PIPELINE       ")
+    print(" COMPETITIVE BUSINESS ENTITY RESOLUTION PIPELINE (V4 - HIGH PRECISION) ")
     print(f"Test Directory:   {test_dir}")
     print(f"Output Directory: {output_dir}")
-    print(f"Model Artifact:   {model_path}")
     print("="*75)
     
     os.makedirs(output_dir, exist_ok=True)
     t_start = time.time()
     
-    # Load trained model artifact
-    artifact = joblib.load(model_path)
-    clf = artifact["model"]
-    base_threshold = artifact.get("threshold", 0.80)
-    print(f"Model loaded successfully (n_iter={clf.n_iter_}, max_leaves={clf.max_leaf_nodes})")
+    # Load dedicated country models
+    src_dir = os.path.dirname(__file__)
+    us_model_path = os.path.join(src_dir, "model_US.joblib")
+    india_model_path = os.path.join(src_dir, "model_India.joblib")
     
-    # Country-calibrated dual thresholds (optimized for macro F0.5 precision weighting)
-    # th_addr: threshold when candidate has address
-    # th_no_addr: threshold when candidate has missing address (Source 2 missing address recovery)
+    print(f"Loading dedicated US model from: {us_model_path}")
+    clf_us = joblib.load(us_model_path)["model"]
+    print(f"Loading dedicated India model from: {india_model_path}")
+    clf_india = joblib.load(india_model_path)["model"]
+    
+    models = {
+        "US": clf_us,
+        "France": clf_us, # High-precision transfer for Latin-script European entities
+        "India": clf_india
+    }
+    
+    # Optimized Country Configurations
     COUNTRY_CONFIGS = {
         "France": {
-            "th_addr": 0.88,
-            "th_no_addr": 0.86,
+            "threshold": 0.94,
+            "delta_p": 0.06,
+            "core_min": 0.40,
+            "max_k": 6,
             "top_name": 22,
             "top_addr": 10
         },
         "US": {
-            "th_addr": 0.872,
-            "th_no_addr": 0.820,
+            "threshold": 0.95,
+            "delta_p": 0.06,
+            "core_min": 0.40,
+            "max_k": 6,
             "top_name": 22,
             "top_addr": 10
         },
         "India": {
-            "th_addr": 0.882,
-            "th_no_addr": 0.786,
+            "threshold": 0.95,
+            "delta_p": 0.05,
+            "core_min": 0.40,
+            "max_k": 6,
             "top_name": 22,
             "top_addr": 10
         }
     }
     print(f"Calibrated Configurations:")
     for c, cfg in COUNTRY_CONFIGS.items():
-        print(f"  {c}: th_addr={cfg['th_addr']}, th_no_addr={cfg['th_no_addr']}, top_name={cfg['top_name']}, top_addr={cfg['top_addr']}")
+        print(f"  {c}: th={cfg['threshold']}, delta_p={cfg['delta_p']}, core_min={cfg['core_min']}, max_k={cfg['max_k']}")
     
     # Read test Source 1, Source 2, Source 3
     s1_path = os.path.join(test_dir, "test_source1.tsv")
     s2_path = os.path.join(test_dir, "test_source2.tsv")
     s3_path = os.path.join(test_dir, "test_source3.tsv")
     
-    print(f"Reading test datasets with Polars...")
+    print(f"\nReading test datasets with Polars...")
     t0 = time.time()
     s1_df = pl.read_csv(s1_path, separator="\t")
     s2_df = pl.read_csv(s2_path, separator="\t")
@@ -71,38 +81,41 @@ def run_inference(test_dir="dataset/test", output_dir="output", model_path=None)
     print(f"Loaded: S1 ({len(s1_df):,}), S2 ({len(s2_df):,}), S3 ({len(s3_df):,}) in {time.time()-t0:.2f}s")
     
     original_s1_ids = s1_df["entity_id"].to_list()
-    
     cand_results = {}
-    match_results = {eid: [] for eid in original_s1_ids}
+    match_results = defaultdict(list)
     
     total_s1_processed = 0
     total_candidates_generated = 0
     
-    # -------------------------------------------------------------
-    # PROCESS ALL COUNTRIES: FRANCE, US, INDIA
-    # -------------------------------------------------------------
+    # Process Countries
     active_countries = ["France", "US", "India"]
     
     for country in active_countries:
         c_t0 = time.time()
-        print(f"\n>>> Processing Country: {country} <<<")
+        print(f"\n{'='*75}")
+        print(f">>> Processing Country: {country} <<<")
+        print(f"{'='*75}")
         
         s1_c = s1_df.filter(pl.col("country") == country)
         s2_c = s2_df.filter(pl.col("country") == country)
         s3_c = s3_df.filter(pl.col("country") == country)
         n_s1 = len(s1_c)
         c_cfg = COUNTRY_CONFIGS[country]
+        clf = models[country]
+        
         top_name = c_cfg["top_name"]
         top_addr = c_cfg["top_addr"]
-        th_addr = c_cfg["th_addr"]
-        th_no_addr = c_cfg["th_no_addr"]
+        th = c_cfg["threshold"]
+        delta_p = c_cfg["delta_p"]
+        core_min = c_cfg["core_min"]
+        max_k = c_cfg["max_k"]
+        
         print(f"Country {country}: {n_s1:,} S1 entities, {len(s2_c):,} S2 entities, {len(s3_c):,} S3 entities")
-        print(f"Parameters: th_addr={th_addr:.2f}, th_no_addr={th_no_addr:.2f}, top_name={top_name}, top_addr={top_addr}")
         
         if n_s1 == 0:
             continue
             
-        chk_path = os.path.join(output_dir, f"chk_{country}.joblib")
+        chk_path = os.path.join(output_dir, f"chk_v4_{country}.joblib")
         if os.path.exists(chk_path):
             print(f"Loading cached checkpoint for {country} from {chk_path}...")
             saved = joblib.load(chk_path)
@@ -117,12 +130,12 @@ def run_inference(test_dir="dataset/test", output_dir="output", model_path=None)
             total_candidates_generated += chk_cands
             continue
             
-        # Build Dual IDF Inverted Index on S2 + S3 (max_key_len=1500 for optimal precision & speed)
+        # Build Inverted Index on S2 + S3
         idx_t0 = time.time()
         idx = InvertedIndex(max_key_len=1500)
         idx.add_records(s2_c["entity_id"].to_list(), s2_c["business_name"].to_list(), s2_c["business_address"].to_list(), country=country)
         idx.add_records(s3_c["entity_id"].to_list(), s3_c["business_name"].to_list(), s3_c["business_address"].to_list(), country=country)
-        print(f"Dual IDF Index built in {time.time()-idx_t0:.2f}s with {len(idx.index):,} unique keys and {len(idx.records):,} records")
+        print(f"Inverted Index built in {time.time()-idx_t0:.2f}s with {len(idx.index):,} unique keys and {len(idx.records):,} records")
         
         # Pre-clean S1 entities
         s1_clean_t0 = time.time()
@@ -142,7 +155,8 @@ def run_inference(test_dir="dataset/test", output_dir="output", model_path=None)
             chk_t0 = time.time()
             
             batch_feats = []
-            pair_tracking = [] # list of (eid, cid, ha2)
+            pair_tracking = []
+            chunk_scored = defaultdict(list)
             
             for i in range(chunk_start, chunk_end):
                 eid = s1_eids[i]
@@ -159,72 +173,64 @@ def run_inference(test_dir="dataset/test", output_dir="output", model_path=None)
                 for ci in cand_indices:
                     cid, cn2, ca2, ha2 = idx.records[ci]
                     
-                    # Guardrail: skip pair if name similarity is essentially zero
+                    # Fast preliminary filter: skip if name similarity is practically zero
                     cn1_j = cn1.replace(" ", "")
                     cn2_j = cn2.replace(" ", "")
                     joined_ratio = fuzz.ratio(cn1_j, cn2_j)
                     if joined_ratio < 75 and fuzz.token_set_ratio(cn1, cn2) < 25 and fuzz.partial_ratio(cn1, cn2) < 30:
                         continue
                         
-                    feats = compute_features_precleaned(cn1, ca1, cn2, ca2, ha2)
-                    n_fuzz = feats[0]
-                    n_set = feats[2]
-                    a_set = feats[7]
-                    num_m = feats[10]
+                    feats = compute_features_v2_precleaned(cn1, ca1, cn2, ca2, ha2)
+                    c_token_set = feats[8] # core brand token set ratio
                     
-                    # Multi-tenant commercial building guard:
-                    # Different businesses sharing an office tower/industrial park
-                    n_cut = 0.52 if country == "US" else 0.55
-                    if n_set < n_cut and n_fuzz < n_cut:
-                        continue
-                    if num_m == 0.0 and n_set < (0.62 if country == "US" else 0.65):
+                    # Guard against co-located commercial buildings
+                    if c_token_set < core_min:
                         continue
                         
                     batch_feats.append(feats)
-                    pair_tracking.append((eid, cid, ha2, feats))
+                    pair_tracking.append((eid, cid, c_token_set))
                     
-            # Batched prediction
+            # Batched prediction with dedicated country model
             if batch_feats:
                 X = np.array(batch_feats, dtype=np.float32)
                 probs = clf.predict_proba(X)[:, 1]
-                n_cut = 0.52 if country == "US" else 0.55
-                for (eid, cid, ha2, feats), p in zip(pair_tracking, probs):
-                    eff_threshold = th_addr if ha2 else th_no_addr
+                for (eid, cid, c_sim), p in zip(pair_tracking, probs):
+                    chunk_scored[eid].append((cid, float(p), c_sim))
                     
-                    # High-confidence name match bonus (recovers true missing-address matches)
-                    n_set = feats[2]
-                    a_set = feats[7]
-                    if n_set >= 0.92 and (a_set >= 0.70 or not ha2):
-                        eff_threshold = min(eff_threshold, 0.74)
-                        
-                    if p >= eff_threshold:
-                        match_results[eid].append((cid, float(p)))
-                        c_matches += 1
+                # Apply Relative Drop Filter & Cluster Size Cap per entity
+                for eid, clist in chunk_scored.items():
+                    if not clist:
+                        continue
+                    best_prob = max(p for _, p, _ in clist)
+                    for cid, p, c_sim in clist:
+                        if p >= th and (best_prob - p) <= delta_p:
+                            match_results[eid].append((cid, p))
+                            c_matches += 1
+                    if len(match_results[eid]) > max_k:
+                        match_results[eid].sort(key=lambda x: -x[1])
+                        match_results[eid] = match_results[eid][:max_k]
                         
             chk_el = time.time() - chk_t0
             processed_so_far = chunk_end
             print(f"  Processed {processed_so_far:,}/{n_s1:,} ({processed_so_far/n_s1:.1%}) in {chk_el:.2f}s | Speed: {(chunk_end-chunk_start)/chk_el:.0f} entities/s")
             
-        country_probs = [p for eid in s1_eids for _, p in match_results[eid]]
-        if country_probs:
-            print(f"  {country} Probability Profile: mean={np.mean(country_probs):.3f}, median={np.median(country_probs):.3f}, p10={np.percentile(country_probs,10):.3f}, p90={np.percentile(country_probs,90):.3f}")
-            
         print(f"Completed {country} raw matching in {time.time()-c_t0:.2f}s (candidates: {c_cands:,}, raw matches: {c_matches:,})")
         
-        # Save country checkpoint
-        joblib.dump({"cands": {eid: cand_results[eid] for eid in s1_eids}, "matches": {eid: match_results[eid] for eid in s1_eids}}, chk_path)
-        print(f"Saved fault-tolerant checkpoint: {chk_path}")
+        # Save fault-tolerant country checkpoint
+        joblib.dump({
+            "cands": {eid: cand_results[eid] for eid in s1_eids},
+            "matches": {eid: match_results[eid] for eid in s1_eids}
+        }, chk_path)
+        print(f"Saved checkpoint: {chk_path}")
         
         total_s1_processed += n_s1
         total_candidates_generated += c_cands
         del idx
         del s1_c, s2_c, s3_c
-
-    # -------------------------------------------------------------
-    # 3. BIPARTITE TARGET DISAMBIGUATION (Winner-Takes-All Argmax)
-    # -------------------------------------------------------------
+        
+    # Global Bipartite Target Disambiguation (Winner-Takes-All Argmax)
     print("\n" + "="*75)
-    print("Performing Competitive Target Disambiguation (Bipartite 1-to-1 Optimization)...")
+    print("Performing Global Bipartite Target Disambiguation (1-to-1 Mapping)...")
     print("="*75)
     t_dis0 = time.time()
     
@@ -249,13 +255,11 @@ def run_inference(test_dir="dataset/test", output_dir="output", model_path=None)
     total_singletons = sum(1 for s1_id in original_s1_ids if len(final_matches[s1_id]) == 0)
     print(f"Disambiguation resolved in {time.time()-t_dis0:.2f}s:")
     print(f"  Raw Matches Evaluated:        {total_raw_pairs:,}")
-    print(f"  False Cross-Merges Removed:   {eliminated_conflicts:,}")
+    print(f"  Conflicting Merges Removed:   {eliminated_conflicts:,}")
     print(f"  Final Unique Matches:         {total_matches_predicted:,} (Avg {total_matches_predicted/total_s1_processed:.2f})")
-    print(f"  Final Singletons (1.0 F0.5):  {total_singletons:,} ({total_singletons/total_s1_processed:.2%})")
-        
-    # -------------------------------------------------------------
-    # 4. WRITE SUBMISSION TSV FILES
-    # -------------------------------------------------------------
+    print(f"  Final Singletons (1.0 F0.5):  {total_singletons:,} ({total_singletons/total_s1_processed:.3%}) [Ground Truth: 5.585%]")
+    
+    # Write Official Competition TSV Files
     print("\n" + "="*75)
     print("Writing Official Competition Submission TSV Files...")
     print("="*75)
@@ -263,33 +267,31 @@ def run_inference(test_dir="dataset/test", output_dir="output", model_path=None)
     cand_path = os.path.join(output_dir, "candidate_pairs.tsv")
     match_path = os.path.join(output_dir, "matching_results.tsv")
     
-    # candidate_pairs.tsv
+    # Write candidate_pairs.tsv
     t_w0 = time.time()
     with open(cand_path, "w", encoding="utf-8") as f_cand:
         f_cand.write("source1_entity_id\tcandidate_entity_ids\n")
         for s1_id in original_s1_ids:
             cands = cand_results.get(s1_id, [])
             f_cand.write(f"{s1_id}\t{','.join(cands)}\n")
-            
     cand_size_mb = os.path.getsize(cand_path) / (1024 * 1024)
     print(f"candidate_pairs.tsv written ({cand_size_mb:.2f} MB) in {time.time()-t_w0:.2f}s")
     
-    # matching_results.tsv
+    # Write matching_results.tsv
     t_w1 = time.time()
     with open(match_path, "w", encoding="utf-8") as f_match:
         f_match.write("source1_entity_id\tmatched_entity_ids\n")
         for s1_id in original_s1_ids:
             matches = final_matches.get(s1_id, [])
             f_match.write(f"{s1_id}\t{','.join(matches)}\n")
-            
     match_size_mb = os.path.getsize(match_path) / (1024 * 1024)
     print(f"matching_results.tsv written ({match_size_mb:.2f} MB) in {time.time()-t_w1:.2f}s")
     
     total_time = time.time() - t_start
     print("\n" + "="*75)
-    print(f"INFERENCE COMPLETED in {total_time:.2f}s ({total_time/60:.2f} minutes)!")
+    print(f"FULL PRODUCTION INFERENCE COMPLETED IN {total_time:.2f}s ({total_time/60:.2f} minutes)!")
     print(f"Total S1 Entities:     {total_s1_processed:,}")
-    print(f"Candidate Pairs / S1:  {total_candidates_generated/total_s1_processed:.2f} (Competition Target: 10-50)")
+    print(f"Candidate Pairs / S1:  {total_candidates_generated/total_s1_processed:.2f}")
     print(f"Matching Results Size: {match_size_mb:.2f} MB (Portal Limit: < 200 MB)")
     print("="*75)
 

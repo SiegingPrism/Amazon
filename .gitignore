@@ -5,6 +5,7 @@ dataset/*
 # Large intermediate outputs (> 100 MB GitHub hard limit)
 output/*.tsv
 output/*.joblib
+output/candidate_pairs.tsv.gz
 !output/matching_results.tsv.gz
 
 # Large archive exceeding GitHub 100 MB limit
