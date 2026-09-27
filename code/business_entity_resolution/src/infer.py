@@ -4,7 +4,7 @@ sys.path.insert(0, os.path.abspath(os.path.dirname(__file__) + "/.."))
 import polars as pl
 import numpy as np
 import time, joblib
-from collections import defaultdict
+from collections import defaultdict, Counter
 from rapidfuzz import fuzz
 
 from src.utils import clean_text, clean_address, LEGAL_STOPWORDS
@@ -37,31 +37,31 @@ def run_inference(test_dir="dataset/test", output_dir="output"):
         "India": clf_india
     }
     
-    # Optimized Country Configurations
+    # Optimized Country Configurations (Dual-Track V5 Engine)
     COUNTRY_CONFIGS = {
         "France": {
             "threshold": 0.94,
-            "delta_p": 0.06,
+            "delta_p": 0.08,
             "core_min": 0.40,
-            "max_k": 6,
-            "top_name": 22,
-            "top_addr": 10
+            "max_k": 10,
+            "top_name": 25,
+            "top_addr": 12
         },
         "US": {
-            "threshold": 0.95,
-            "delta_p": 0.06,
-            "core_min": 0.40,
-            "max_k": 6,
-            "top_name": 22,
-            "top_addr": 10
+            "threshold": 0.88,
+            "delta_p": 0.08,
+            "core_min": 0.35,
+            "max_k": 10,
+            "top_name": 25,
+            "top_addr": 12
         },
         "India": {
-            "threshold": 0.95,
-            "delta_p": 0.05,
-            "core_min": 0.40,
-            "max_k": 6,
-            "top_name": 22,
-            "top_addr": 10
+            "threshold": 0.87,
+            "delta_p": 0.08,
+            "core_min": 0.30,
+            "max_k": 10,
+            "top_name": 25,
+            "top_addr": 12
         }
     }
     print(f"Calibrated Configurations:")
@@ -115,7 +115,7 @@ def run_inference(test_dir="dataset/test", output_dir="output"):
         if n_s1 == 0:
             continue
             
-        chk_path = os.path.join(output_dir, f"chk_v4_{country}.joblib")
+        chk_path = os.path.join(output_dir, f"chk_v5_{country}.joblib")
         if os.path.exists(chk_path):
             print(f"Loading cached checkpoint for {country} from {chk_path}...")
             saved = joblib.load(chk_path)
@@ -144,7 +144,8 @@ def run_inference(test_dir="dataset/test", output_dir="output"):
         s1_raw_addrs = s1_c["business_address"].to_list()
         s1_clean_addrs = [clean_address(a, country=country) if a else "" for a in s1_raw_addrs]
         s1_has_addrs = [bool(a) for a in s1_raw_addrs]
-        print(f"Pre-cleaned {n_s1:,} S1 entities in {time.time()-s1_clean_t0:.2f}s")
+        addr_freq = Counter(a for a in s1_clean_addrs if a)
+        print(f"Pre-cleaned {n_s1:,} S1 entities in {time.time()-s1_clean_t0:.2f}s (unique addresses: {len(addr_freq):,})")
         
         c_matches = 0
         c_cands = 0
@@ -173,37 +174,55 @@ def run_inference(test_dir="dataset/test", output_dir="output"):
                 for ci in cand_indices:
                     cid, cn2, ca2, ha2 = idx.records[ci]
                     
-                    # Fast preliminary filter: skip if name similarity is practically zero
+                    # Fast preliminary filter
                     cn1_j = cn1.replace(" ", "")
                     cn2_j = cn2.replace(" ", "")
                     joined_ratio = fuzz.ratio(cn1_j, cn2_j)
-                    if joined_ratio < 75 and fuzz.token_set_ratio(cn1, cn2) < 25 and fuzz.partial_ratio(cn1, cn2) < 30:
-                        continue
-                        
+                    
+                    # Allow if basic name match OR potential address match
+                    if joined_ratio < 70 and fuzz.token_set_ratio(cn1, cn2) < 25 and fuzz.partial_ratio(cn1, cn2) < 30:
+                        if not (ha1 and ha2 and ca1 and ca2 and fuzz.token_set_ratio(ca1[:30], ca2[:30]) >= 70):
+                            continue
+                            
                     feats = compute_features_v2_precleaned(cn1, ca1, cn2, ca2, ha2)
                     c_token_set = feats[8] # core brand token set ratio
+                    sk_sim = feats[16]      # phonetic skeleton similarity
+                    addr_sim = feats[12]    # address token set ratio
+                    num_match = feats[15]   # street number match
                     
-                    # Guard against co-located commercial buildings
-                    if c_token_set < core_min:
+                    # Track 1: Brand-Led Matching
+                    is_brand = (c_token_set >= core_min or sk_sim >= 0.80 or joined_ratio >= 70)
+                    
+                    # Track 2: Unique Location Matching (DBAs / Aliases like Gildcalo, Wexveo, Zephdrex, URLs)
+                    is_unique_loc = (
+                        ha1 and ha2
+                        and num_match == 1.0
+                        and addr_sim >= 0.88
+                        and feats[14] >= 0.40
+                        and (addr_freq.get(ca1, 1) <= 2)
+                    )
+                    
+                    if not (is_brand or is_unique_loc):
                         continue
                         
                     batch_feats.append(feats)
-                    pair_tracking.append((eid, cid, c_token_set))
+                    pair_tracking.append((eid, cid, is_unique_loc))
                     
             # Batched prediction with dedicated country model
             if batch_feats:
                 X = np.array(batch_feats, dtype=np.float32)
                 probs = clf.predict_proba(X)[:, 1]
-                for (eid, cid, c_sim), p in zip(pair_tracking, probs):
-                    chunk_scored[eid].append((cid, float(p), c_sim))
+                for (eid, cid, is_ul), p in zip(pair_tracking, probs):
+                    chunk_scored[eid].append((cid, float(p), is_ul))
                     
                 # Apply Relative Drop Filter & Cluster Size Cap per entity
                 for eid, clist in chunk_scored.items():
                     if not clist:
                         continue
                     best_prob = max(p for _, p, _ in clist)
-                    for cid, p, c_sim in clist:
-                        if p >= th and (best_prob - p) <= delta_p:
+                    for cid, p, is_ul in clist:
+                        eff_th = min(th, 0.82) if is_ul else th
+                        if p >= eff_th and (best_prob - p) <= delta_p:
                             match_results[eid].append((cid, p))
                             c_matches += 1
                     if len(match_results[eid]) > max_k:
